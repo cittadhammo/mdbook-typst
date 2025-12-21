@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use pullup::converter;
-use pullup::markdown::{Event as MdEvent, Tag as MdTag};
+use pullup::markdown::{Event as MdEvent, Tag as MdTag, TagEnd as MdTagEnd};
 use pullup::mdbook::{Event as MdbookEvent, Tag as MdbookTag};
 use pullup::typst::{Event as TypstEvent, Tag as TypstTag};
 use pullup::ParserEvent;
@@ -70,19 +70,21 @@ where
             }
             (
                 true,
-                Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(num, toc, bookmarks)))),
+                Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(num, toc, bookmarks, label)))),
             ) => Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(
                 num.saturating_add(1),
                 toc,
                 bookmarks,
+                label,
             )))),
             (
                 true,
-                Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(num, toc, bookmarks)))),
+                Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(num, toc, bookmarks, label)))),
             ) => Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(
                 num.saturating_add(1),
                 toc,
                 bookmarks,
+                label,
             )))),
             (_, x) => x,
         }
@@ -118,11 +120,11 @@ where
             (
                 Some(
                     event @ ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::End(
-                        MdTag::Heading(_, _, _),
+                        MdTagEnd::Heading(_),
                     ))),
                 ),
                 Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::Start(
-                    MdTag::Heading(_, _, _),
+                    MdTag::Heading { .. },
                 )))),
             ) => {
                 self.prev = Some(event.clone());
@@ -130,21 +132,21 @@ where
                     !matches!(
                         x,
                         ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::End(
-                            MdTag::Heading(_, _, _)
+                            MdTagEnd::Heading(_)
                         ),)),
                     )
                 });
                 self.iter.next()
             }
             (
-                event @ Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(_, _, _)))),
-                Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(_, _, _)))),
+                event @ Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(..)))),
+                Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(..)))),
             ) => {
                 self.prev = event.clone();
                 let _ = self.iter.find(|x| {
                     matches!(
                         x,
-                        ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(_, _, _)))
+                        ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(..)))
                     )
                 });
                 self.iter.next()
