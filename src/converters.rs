@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pullup::converter;
 use pullup::markdown::{CodeBlockKind, CowStr, Event as MdEvent, Tag as MdTag, TagEnd as MdTagEnd};
 use pullup::mdbook::{Event as MdbookEvent, Tag as MdbookTag};
 use pullup::typst::{CodeBlockDisplay, Event as TypstEvent, Tag as TypstTag};
@@ -190,42 +189,6 @@ where
         }
     }
 }
-
-converter!(
-    /// Convert parts to cover pages.
-    PartToCoverPageX,
-    ParserEvent<'a> => ParserEvent<'a>,
-    |this: &mut Self| {
-        match this.iter.next() {
-            Some(ParserEvent::Mdbook(MdbookEvent::Start(MdbookTag::Part(name, _)))) => {
-                if let Some(name) = name {
-                    Some(ParserEvent::Typst(TypstEvent::Raw(
-                        format!(
-                        r#"
-                        #set page(
-                            header: none,
-                        )
-                        #heading(level: 1, outlined: false, "{}")
-                        #pagebreak()
-                        #set page(
-                            header:  text(size: 8pt, fill: gray)[#align(right)[{}]],
-                        )
-                        {}"#, name, name, '\n').into()))
-                    )
-                } else {
-                    this.next()
-                }
-            },
-            Some(ParserEvent::Mdbook(MdbookEvent::End(MdbookTag::Part( _, _)))) => {
-                Some(ParserEvent::Typst(TypstEvent::FunctionCall(
-                    None,
-                    "pagebreak".into(),
-                    vec!["weak: true".into()],
-                )))
-            },
-            x => x,
-    }
-});
 
 /// Parse mdBook code block info string into language and attributes.
 /// Format: "lang" or "lang,attr1,attr2" or "lang,attr1,key=value"
@@ -577,9 +540,12 @@ where
 /// ```
 ///
 /// This converter extracts those IDs and emits them as Typst labels.
+/// It also handles `<span class="caption">` for figure captions.
 pub struct ConvertHtmlAnchors<T> {
     iter: T,
     css_styles: Arc<CssClassStyles>,
+    in_caption_span: bool,
+    caption_content: String,
 }
 
 impl<'a, T> ConvertHtmlAnchors<T>
@@ -587,7 +553,12 @@ where
     T: Iterator<Item = ParserEvent<'a>>,
 {
     pub fn new(iter: T, css_styles: Arc<CssClassStyles>) -> Self {
-        Self { iter, css_styles }
+        Self {
+            iter,
+            css_styles,
+            in_caption_span: false,
+            caption_content: String::new(),
+        }
     }
 }
 
@@ -598,42 +569,135 @@ where
     type Item = ParserEvent<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.next() {
-            // Handle block-level HTML
-            Some(ParserEvent::Markdown(MdEvent::Html(html))) => {
-                convert_html_to_typst(html.as_ref(), &self.css_styles)
-            }
-            // Handle inline HTML (this is where <a id="..."> often appears)
-            Some(ParserEvent::Markdown(MdEvent::InlineHtml(html))) => {
-                convert_html_to_typst(html.as_ref(), &self.css_styles)
-            }
-            // Handle mdbook wrapper for block HTML
-            Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::Html(html)))) => {
-                convert_html_to_typst(html.as_ref(), &self.css_styles)
-            }
-            // Handle mdbook wrapper for inline HTML
-            Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::InlineHtml(
-                html,
-            )))) => convert_html_to_typst(html.as_ref(), &self.css_styles),
-            // Handle Typst Raw events that contain HTML comments (from pullup's conversion)
-            // These look like: /* HTML: <actual html> */
-            Some(ParserEvent::Typst(TypstEvent::Raw(raw))) => {
-                if let Some(html) = extract_html_from_comment(raw.as_ref()) {
-                    if let Some(converted) = convert_html_to_typst(&html, &self.css_styles) {
-                        // Only use conversion if it's not just another comment
-                        if !matches!(&converted, ParserEvent::Typst(TypstEvent::Raw(r)) if r.contains("/* HTML:"))
-                        {
-                            return Some(converted);
+        loop {
+            let event = self.iter.next();
+
+            // Check if we're collecting caption content
+            if self.in_caption_span {
+                match &event {
+                    // Text content while in caption span - collect it
+                    Some(ParserEvent::Typst(TypstEvent::Text(text))) => {
+                        self.caption_content.push_str(text.as_ref());
+                        continue; // Keep collecting
+                    }
+                    // Code/raw content while in caption span
+                    Some(ParserEvent::Typst(TypstEvent::Code(code))) => {
+                        self.caption_content.push('`');
+                        self.caption_content.push_str(code.as_ref());
+                        self.caption_content.push('`');
+                        continue;
+                    }
+                    // Check for closing </span>
+                    Some(ParserEvent::Markdown(MdEvent::Html(html)))
+                    | Some(ParserEvent::Markdown(MdEvent::InlineHtml(html)))
+                        if html.trim() == "</span>" =>
+                    {
+                        self.in_caption_span = false;
+                        let caption = std::mem::take(&mut self.caption_content);
+                        // Emit styled caption
+                        return Some(ParserEvent::Typst(TypstEvent::Raw(
+                            format!("#align(center)[#emph[{}]]\n", caption).into(),
+                        )));
+                    }
+                    Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(
+                        MdEvent::Html(html),
+                    )))
+                    | Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(
+                        MdEvent::InlineHtml(html),
+                    ))) if html.trim() == "</span>" => {
+                        self.in_caption_span = false;
+                        let caption = std::mem::take(&mut self.caption_content);
+                        return Some(ParserEvent::Typst(TypstEvent::Raw(
+                            format!("#align(center)[#emph[{}]]\n", caption).into(),
+                        )));
+                    }
+                    // Other events while in caption - skip them
+                    Some(_) => continue,
+                    None => {
+                        // End of input while in caption - emit what we have
+                        self.in_caption_span = false;
+                        if !self.caption_content.is_empty() {
+                            let caption = std::mem::take(&mut self.caption_content);
+                            return Some(ParserEvent::Typst(TypstEvent::Raw(
+                                format!("#align(center)[#emph[{}]]\n", caption).into(),
+                            )));
                         }
+                        return None;
                     }
                 }
-                // Pass through unchanged if not convertible
-                Some(ParserEvent::Typst(TypstEvent::Raw(raw)))
             }
-            // Pass through all other events
-            x => x,
+
+            return match event {
+                // Handle block-level HTML
+                Some(ParserEvent::Markdown(MdEvent::Html(ref html))) => {
+                    if is_caption_span_open(html.as_ref()) {
+                        self.in_caption_span = true;
+                        self.caption_content.clear();
+                        continue; // Start collecting
+                    }
+                    convert_html_to_typst(html.as_ref(), &self.css_styles)
+                }
+                // Handle inline HTML
+                Some(ParserEvent::Markdown(MdEvent::InlineHtml(ref html))) => {
+                    if is_caption_span_open(html.as_ref()) {
+                        self.in_caption_span = true;
+                        self.caption_content.clear();
+                        continue;
+                    }
+                    convert_html_to_typst(html.as_ref(), &self.css_styles)
+                }
+                // Handle mdbook wrapper for block HTML
+                Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::Html(
+                    ref html,
+                )))) => {
+                    if is_caption_span_open(html.as_ref()) {
+                        self.in_caption_span = true;
+                        self.caption_content.clear();
+                        continue;
+                    }
+                    convert_html_to_typst(html.as_ref(), &self.css_styles)
+                }
+                // Handle mdbook wrapper for inline HTML
+                Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(
+                    MdEvent::InlineHtml(ref html),
+                ))) => {
+                    if is_caption_span_open(html.as_ref()) {
+                        self.in_caption_span = true;
+                        self.caption_content.clear();
+                        continue;
+                    }
+                    convert_html_to_typst(html.as_ref(), &self.css_styles)
+                }
+                // Handle Typst Raw events that contain HTML comments
+                Some(ParserEvent::Typst(TypstEvent::Raw(raw))) => {
+                    if let Some(html) = extract_html_from_comment(raw.as_ref()) {
+                        if is_caption_span_open(&html) {
+                            self.in_caption_span = true;
+                            self.caption_content.clear();
+                            continue;
+                        }
+                        if let Some(converted) = convert_html_to_typst(&html, &self.css_styles) {
+                            if !matches!(&converted, ParserEvent::Typst(TypstEvent::Raw(r)) if r.contains("/* HTML:"))
+                            {
+                                return Some(converted);
+                            }
+                        }
+                    }
+                    Some(ParserEvent::Typst(TypstEvent::Raw(raw)))
+                }
+                // Pass through all other events
+                x => x,
+            };
         }
     }
+}
+
+/// Check if HTML is an opening caption span tag.
+fn is_caption_span_open(html: &str) -> bool {
+    let html = html.trim();
+    html.starts_with("<span ")
+        && (html.contains("class=\"caption\"") || html.contains("class='caption'"))
+        && !html.contains("</span>")
 }
 
 /// Copy referenced assets (images) from source to destination as they are encountered.
@@ -720,7 +784,7 @@ where
         // Check for image events and copy the referenced file
         match &event {
             // Typst image events
-            ParserEvent::Typst(TypstEvent::Start(TypstTag::Image(src, _))) => {
+            ParserEvent::Typst(TypstEvent::Start(TypstTag::Image(src, ..))) => {
                 self.copy_asset(src.as_ref());
             }
             // Markdown image events
@@ -775,13 +839,29 @@ where
 /// Handles:
 /// - `<a id="...">` -> Typst label
 /// - `<img src="..." alt="...">` -> Typst image with CSS-based sizing
+/// - `<span class="caption">...</span>` -> Styled caption text
 /// - Other HTML -> comment
 fn convert_html_to_typst(html: &str, css_styles: &CssClassStyles) -> Option<ParserEvent<'static>> {
+    let html_trimmed = html.trim();
+
     // Check for anchor with id
     if let Some(id) = extract_anchor_id(html) {
         return Some(ParserEvent::Typst(TypstEvent::Raw(
             format!("#[] <{}>\n", id).into(),
         )));
+    }
+
+    // Check for span with class="caption" - extract content and style it
+    if let Some(caption) = extract_span_caption(html_trimmed) {
+        // Render as centered, italic text with the figure number bold
+        return Some(ParserEvent::Typst(TypstEvent::Raw(
+            format!("#align(center)[#emph[{}]]\n", caption).into(),
+        )));
+    }
+
+    // Check for closing </span> tag (ignore it, content was already handled)
+    if html_trimmed == "</span>" {
+        return Some(ParserEvent::Typst(TypstEvent::Raw("".into())));
     }
 
     // Check for img tag
@@ -965,6 +1045,151 @@ fn extract_html_class(html: &str) -> Option<String> {
 
         class.map(|s| s.to_string())
     } else {
+        None
+    }
+}
+
+/// Resolve CSS classes on Image events to actual width/height values.
+///
+/// When pullup converts HTML img tags to Typst Image events, it preserves the
+/// CSS class but not the resolved dimensions. This converter looks up the class
+/// in the parsed CSS and substitutes the width/height values.
+pub struct ResolveCssImageStyles<'a, T> {
+    iter: T,
+    css_styles: Arc<CssClassStyles>,
+    _p: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, T> ResolveCssImageStyles<'a, T>
+where
+    T: Iterator<Item = ParserEvent<'a>>,
+{
+    pub fn new(iter: T, css_styles: Arc<CssClassStyles>) -> Self {
+        Self {
+            iter,
+            css_styles,
+            _p: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, T> Iterator for ResolveCssImageStyles<'a, T>
+where
+    T: Iterator<Item = ParserEvent<'a>>,
+{
+    type Item = ParserEvent<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.next() {
+            // Handle Image Start events
+            Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Image(
+                src,
+                alt,
+                class,
+                width,
+                height,
+            )))) => {
+                // Resolve width/height from CSS class if we have a class and no dimensions
+                let (resolved_width, resolved_height) = if let Some(ref c) = class {
+                    let w = width
+                        .clone()
+                        .or_else(|| self.css_styles.get_width(c.as_ref()).map(CowStr::from));
+                    let h = height
+                        .clone()
+                        .or_else(|| self.css_styles.get_height(c.as_ref()).map(CowStr::from));
+                    (w, h)
+                } else {
+                    (width, height)
+                };
+
+                // Clear alt text for images with a class - these are HTML images that
+                // typically have a separate <span class="caption"> for the actual caption.
+                // Keeping the alt would cause Typst to wrap in #figure with auto-numbering.
+                let resolved_alt = if class.is_some() {
+                    CowStr::from("")
+                } else {
+                    alt
+                };
+
+                Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Image(
+                    src,
+                    resolved_alt,
+                    class,
+                    resolved_width,
+                    resolved_height,
+                ))))
+            }
+            // Handle Image End events (keep in sync with Start)
+            Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Image(
+                src,
+                alt,
+                class,
+                width,
+                height,
+            )))) => {
+                let (resolved_width, resolved_height) = if let Some(ref c) = class {
+                    let w = width
+                        .clone()
+                        .or_else(|| self.css_styles.get_width(c.as_ref()).map(CowStr::from));
+                    let h = height
+                        .clone()
+                        .or_else(|| self.css_styles.get_height(c.as_ref()).map(CowStr::from));
+                    (w, h)
+                } else {
+                    (width, height)
+                };
+
+                let resolved_alt = if class.is_some() {
+                    CowStr::from("")
+                } else {
+                    alt
+                };
+
+                Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Image(
+                    src,
+                    resolved_alt,
+                    class,
+                    resolved_width,
+                    resolved_height,
+                ))))
+            }
+            x => x,
+        }
+    }
+}
+
+/// Extract content from a `<span class="caption">...</span>` tag.
+/// Returns the inner text content if this is a caption span.
+fn extract_span_caption(html: &str) -> Option<String> {
+    let html = html.trim();
+
+    // Check if it starts with <span and has class="caption"
+    if !html.starts_with("<span ") {
+        return None;
+    }
+
+    // Check for class="caption"
+    if !html.contains("class=\"caption\"") && !html.contains("class='caption'") {
+        return None;
+    }
+
+    // Find the end of the opening tag
+    let tag_end = html.find('>')?;
+    let rest = &html[tag_end + 1..];
+
+    // Find the closing </span>
+    if let Some(close_pos) = rest.find("</span>") {
+        let content = &rest[..close_pos];
+        // Escape special Typst characters in the content
+        let escaped = content
+            .replace('#', "\\#")
+            .replace('$', "\\$")
+            .replace('<', "\\<")
+            .replace('>', "\\>");
+        Some(escaped.trim().to_string())
+    } else {
+        // Opening tag only - content will come in subsequent events
+        // Return empty to signal we're in a caption span
         None
     }
 }

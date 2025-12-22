@@ -333,4 +333,47 @@ mod tests {
         assert_eq!(img.typst_width(), Some("200pt".to_string()));
         assert_eq!(img.typst_height(), Some("100pt".to_string()));
     }
+
+    #[test]
+    fn parse_ferris_css() {
+        let mut styles = CssClassStyles::new();
+        styles.parse_css(
+            r#"
+body.light .does_not_compile,
+body.light .panics {
+  background: #fff1f1;
+}
+
+.ferris-container {
+  position: absolute;
+  z-index: 99;
+}
+
+.ferris {
+  vertical-align: top;
+  margin-left: 0.2em;
+  height: auto;
+}
+
+.ferris-large {
+  width: 4.5em;
+}
+
+.ferris-small {
+  width: 2.3em;
+}
+
+.ferris-explain {
+  width: 100px;
+}
+        "#,
+        );
+
+        assert_eq!(
+            styles.get_width("ferris-explain"),
+            Some("100pt".to_string())
+        );
+        assert_eq!(styles.get_width("ferris-large"), Some("4.5em".to_string()));
+        assert_eq!(styles.get_width("ferris-small"), Some("2.3em".to_string()));
+    }
 }

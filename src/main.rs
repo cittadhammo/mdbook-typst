@@ -16,7 +16,7 @@ mod css;
 use config::Config;
 use converters::{
     ConvertCallouts, ConvertHtmlAnchors, CopyReferencedAssets, FixCodeBlockFence,
-    FixHeadingStutter, PartToCoverPage,
+    FixHeadingStutter, PartToCoverPage, ResolveCssImageStyles,
 };
 use css::CssClassStyles;
 
@@ -95,6 +95,9 @@ fn main() -> Result<(), std::io::Error> {
     // Convert HTML anchor elements (<a id="...">) and img tags to Typst.
     events = Box::new(ConvertHtmlAnchors::new(events, css_styles.clone()));
 
+    // Resolve CSS classes on Image events to actual width/height values.
+    events = Box::new(ResolveCssImageStyles::new(events, css_styles.clone()));
+
     // Figure out the output filename and location.
     let outname = if let Some(n) = cfg.output.name {
         use config::OutputFormat;
@@ -172,18 +175,15 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .paragraph_spacing
         .as_ref()
-        .map_or(Some(config::default_paragraph_spacing()), |s| none_on_empty(s))
+        .map_or(Some(config::default_paragraph_spacing()), |s| {
+            none_on_empty(s)
+        })
     {
-        let tag = pullup::typst::Tag::Show(
-            pullup::typst::ShowType::ShowSet,
+        style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Set(
             "par".into(),
-            Some(("block".into(), "spacing".into(), paragraph_spacing.into())),
-            None,
-        );
-        style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Start(
-            tag.clone(),
+            "spacing".into(),
+            paragraph_spacing.into(),
         )));
-        style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::End(tag)));
     }
 
     // Paragraph leading.
@@ -191,7 +191,9 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .paragraph_leading
         .as_ref()
-        .map_or(Some(config::default_paragraph_leading()), |s| none_on_empty(s))
+        .map_or(Some(config::default_paragraph_leading()), |s| {
+            none_on_empty(s)
+        })
     {
         style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Set(
             "par".into(),
@@ -202,7 +204,12 @@ fn main() -> Result<(), std::io::Error> {
 
     // Heading numbering.
     // Note this is a bit different as we don't set a default.
-    if let Some(heading_numbering) = cfg.style.heading_numbering.as_ref().and_then(|s| none_on_empty(s)) {
+    if let Some(heading_numbering) = cfg
+        .style
+        .heading_numbering
+        .as_ref()
+        .and_then(|s| none_on_empty(s))
+    {
         style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Set(
             "heading".into(),
             "numbering".into(),
@@ -293,10 +300,14 @@ fn main() -> Result<(), std::io::Error> {
 
     // Horizontal rule replacement. This is required as Typst doesn't have the concept
     // of a horizontal rule (unlike Markdown and HTML).
-    if let Some(rule) = cfg.markup.horizontal_rule.as_ref().map_or(
-        Some(config::default_markup_horizontal_rule()),
-        |s| none_on_empty(s),
-    ) {
+    if let Some(rule) = cfg
+        .markup
+        .horizontal_rule
+        .as_ref()
+        .map_or(Some(config::default_markup_horizontal_rule()), |s| {
+            none_on_empty(s)
+        })
+    {
         horizontal_rule_replacement = rule;
         events = Box::new(events.map(|e| match e {
             pullup::ParserEvent::Markdown(MdEvent::Rule) => pullup::ParserEvent::Typst(
@@ -320,7 +331,9 @@ fn main() -> Result<(), std::io::Error> {
             .toc
             .entry_show_rules
             .as_ref()
-            .map_or(config::default_toc_entry_show_rules(), |v| none_on_empty_vec(v))
+            .map_or(config::default_toc_entry_show_rules(), |v| {
+                none_on_empty_vec(v)
+            })
         {
             toc_events.extend(show_rules.into_iter().flat_map(|x| {
                 let it = if x.strong.unwrap() {
@@ -332,17 +345,7 @@ fn main() -> Result<(), std::io::Error> {
                     pullup::typst::ShowType::Function,
                     format!("outline.entry.where(level: {})", x.level.unwrap()).into(),
                     None,
-                    Some(
-                        format!(
-                            "it => {{
-                                    v({}, weak: true)
-                                   {} 
-                                }}",
-                            x.text_size.unwrap(),
-                            it
-                        )
-                        .into(),
-                    ),
+                    Some(format!("it => block(above: {})[#{}]", x.text_size.unwrap(), it).into()),
                 );
                 vec![
                     pullup::ParserEvent::Typst(pullup::typst::Event::Start(tag.clone())),
