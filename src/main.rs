@@ -13,7 +13,7 @@ mod config;
 mod converters;
 
 use config::Config;
-use converters::{FixHeadingStutter, PartToCoverPage};
+use converters::{ConvertCallouts, ConvertHtmlAnchors, CopyReferencedAssets, FixCodeBlockFence, PartToCoverPage};
 
 fn none_on_empty(x: &String) -> Option<String> {
     if x.is_empty() {
@@ -62,7 +62,23 @@ fn main() -> Result<(), std::io::Error> {
     // Run some special converters.
     events = Box::new(PartToCoverPage::new(events));
 
-    events = Box::new(FixHeadingStutter::new(events));
+    // Fix mdBook code block fence names (e.g., "rust,ignore" -> "rust")
+    // and handle filename attributes.
+    events = Box::new(FixCodeBlockFence::new(events));
+
+    // Convert blockquotes starting with "Note:", "Warning:", etc. to styled callouts.
+    events = Box::new(ConvertCallouts::new(events));
+
+    // Copy referenced assets (images) to the destination directory.
+    // This must come BEFORE ConvertHtmlAnchors so it can see HTML img events.
+    events = Box::new(CopyReferencedAssets::new(
+        events,
+        ctx.source_dir(),
+        ctx.destination.clone(),
+    ));
+
+    // Convert HTML anchor elements (<a id="...">) and img tags to Typst.
+    events = Box::new(ConvertHtmlAnchors::new(events));
 
     // Figure out the output filename and location.
     let outname = if let Some(n) = cfg.output.name {
