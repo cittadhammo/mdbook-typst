@@ -11,23 +11,28 @@ use pullup::ParserEvent;
 
 mod config;
 mod converters;
+mod css;
 
 use config::Config;
-use converters::{ConvertCallouts, ConvertHtmlAnchors, CopyReferencedAssets, FixCodeBlockFence, PartToCoverPage};
+use converters::{
+    ConvertCallouts, ConvertHtmlAnchors, CopyReferencedAssets, FixCodeBlockFence,
+    FixHeadingStutter, PartToCoverPage,
+};
+use css::CssClassStyles;
 
-fn none_on_empty(x: &String) -> Option<String> {
+fn none_on_empty(x: &str) -> Option<String> {
     if x.is_empty() {
         None
     } else {
-        Some(x.clone())
+        Some(x.to_string())
     }
 }
 
-fn none_on_empty_vec<T: Clone>(x: &Vec<T>) -> Option<Vec<T>> {
+fn none_on_empty_vec<T: Clone>(x: &[T]) -> Option<Vec<T>> {
     if x.is_empty() {
         None
     } else {
-        Some(x.clone())
+        Some(x.to_vec())
     }
 }
 
@@ -46,6 +51,13 @@ fn main() -> Result<(), std::io::Error> {
 
     let horizontal_rule_replacement: String;
 
+    // Load CSS styles from the book's source directory.
+    let mut css_styles = CssClassStyles::new();
+    css_styles.load_css_directory(&ctx.source_dir());
+    // Also load CSS from the root (where ferris.css typically lives)
+    css_styles.load_css_directory(&ctx.root);
+    let css_styles = std::sync::Arc::new(css_styles);
+
     // Parse mdbook to events.
     let parser = pullup::mdbook::Parser::from_rendercontext(&ctx);
 
@@ -61,6 +73,9 @@ fn main() -> Result<(), std::io::Error> {
 
     // Run some special converters.
     events = Box::new(PartToCoverPage::new(events));
+
+    // Fix heading stutter (duplicate chapter title + first heading).
+    events = Box::new(FixHeadingStutter::new(events));
 
     // Fix mdBook code block fence names (e.g., "rust,ignore" -> "rust")
     // and handle filename attributes.
@@ -78,7 +93,7 @@ fn main() -> Result<(), std::io::Error> {
     ));
 
     // Convert HTML anchor elements (<a id="...">) and img tags to Typst.
-    events = Box::new(ConvertHtmlAnchors::new(events));
+    events = Box::new(ConvertHtmlAnchors::new(events, css_styles.clone()));
 
     // Figure out the output filename and location.
     let outname = if let Some(n) = cfg.output.name {
@@ -115,7 +130,7 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .paper
         .as_ref()
-        .map_or(Some(config::default_paper()), none_on_empty)
+        .map_or(Some(config::default_paper()), |s| none_on_empty(s))
     {
         style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Set(
             "page".into(),
@@ -129,7 +144,7 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .text_size
         .as_ref()
-        .map_or(Some(config::default_text_size()), none_on_empty)
+        .map_or(Some(config::default_text_size()), |s| none_on_empty(s))
     {
         style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Set(
             "text".into(),
@@ -143,7 +158,7 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .text_font
         .as_ref()
-        .map_or(Some(config::default_text_font()), none_on_empty)
+        .map_or(Some(config::default_text_font()), |s| none_on_empty(s))
     {
         style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Set(
             "text".into(),
@@ -157,7 +172,7 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .paragraph_spacing
         .as_ref()
-        .map_or(Some(config::default_paragraph_spacing()), none_on_empty)
+        .map_or(Some(config::default_paragraph_spacing()), |s| none_on_empty(s))
     {
         let tag = pullup::typst::Tag::Show(
             pullup::typst::ShowType::ShowSet,
@@ -176,7 +191,7 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .paragraph_leading
         .as_ref()
-        .map_or(Some(config::default_paragraph_leading()), none_on_empty)
+        .map_or(Some(config::default_paragraph_leading()), |s| none_on_empty(s))
     {
         style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Set(
             "par".into(),
@@ -187,7 +202,7 @@ fn main() -> Result<(), std::io::Error> {
 
     // Heading numbering.
     // Note this is a bit different as we don't set a default.
-    if let Some(heading_numbering) = cfg.style.heading_numbering.as_ref().and_then(none_on_empty) {
+    if let Some(heading_numbering) = cfg.style.heading_numbering.as_ref().and_then(|s| none_on_empty(s)) {
         style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Set(
             "heading".into(),
             "numbering".into(),
@@ -201,12 +216,12 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .heading_above
         .as_ref()
-        .map_or(Some(config::default_heading_above()), none_on_empty);
+        .map_or(Some(config::default_heading_above()), |s| none_on_empty(s));
     let heading_below = cfg
         .style
         .heading_below
         .as_ref()
-        .map_or(Some(config::default_heading_below()), none_on_empty);
+        .map_or(Some(config::default_heading_below()), |s| none_on_empty(s));
     match (heading_above, heading_below) {
         (None, None) => (),
         (None, Some(below)) => {
@@ -265,7 +280,7 @@ fn main() -> Result<(), std::io::Error> {
         .style
         .link_color
         .as_ref()
-        .map_or(Some(config::default_link_color()), none_on_empty)
+        .map_or(Some(config::default_link_color()), |s| none_on_empty(s))
     {
         style_events.push(pullup::ParserEvent::Typst(pullup::typst::Event::Raw(
             format!("#show link: set text({})\n", link_color).into(),
@@ -280,7 +295,7 @@ fn main() -> Result<(), std::io::Error> {
     // of a horizontal rule (unlike Markdown and HTML).
     if let Some(rule) = cfg.markup.horizontal_rule.as_ref().map_or(
         Some(config::default_markup_horizontal_rule()),
-        none_on_empty,
+        |s| none_on_empty(s),
     ) {
         horizontal_rule_replacement = rule;
         events = Box::new(events.map(|e| match e {
@@ -305,7 +320,7 @@ fn main() -> Result<(), std::io::Error> {
             .toc
             .entry_show_rules
             .as_ref()
-            .map_or(config::default_toc_entry_show_rules(), none_on_empty_vec)
+            .map_or(config::default_toc_entry_show_rules(), |v| none_on_empty_vec(v))
         {
             toc_events.extend(show_rules.into_iter().flat_map(|x| {
                 let it = if x.strong.unwrap() {
@@ -353,7 +368,7 @@ fn main() -> Result<(), std::io::Error> {
             .toc
             .indent
             .as_ref()
-            .map_or(Some(config::default_toc_indent()), none_on_empty)
+            .map_or(Some(config::default_toc_indent()), |s| none_on_empty(s))
         {
             args.push(format!("indent: {}", indent).into())
         }
@@ -403,11 +418,15 @@ fn main() -> Result<(), std::io::Error> {
     // Convert the events to Typst markup.
     let markup = TypstMarkup::new(events);
 
+    // Collect all markup into a string first
+    let full_markup: String = markup.collect();
+
+    // Post-process HTML comments embedded in table cells to convert them to images
+    let full_markup = converters::process_html_comments(&full_markup, &css_styles);
+
     // Write the Typst markup to filesystem.
     let mut f = File::create(&markup_path).unwrap();
-    for m in markup {
-        write!(f, "{}", m)?;
-    }
+    write!(f, "{}", full_markup)?;
 
     // Command to use to call the `typst` binary for further processing if required.
     // TODO: use the `typst` library directly.

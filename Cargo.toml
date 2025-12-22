@@ -19,3 +19,5 @@ pullup = { version = "0.3.9", features = [
     "tracing"
 ] }
 serde = { version = "1.0", features = ["derive"] }
+cssparser = "0.34"
+regex = "1"

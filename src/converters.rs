@@ -1,12 +1,15 @@
 use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pullup::converter;
-use pullup::markdown::{CodeBlockKind, CowStr, Event as MdEvent, Tag as MdTag};
+use pullup::markdown::{CodeBlockKind, CowStr, Event as MdEvent, Tag as MdTag, TagEnd as MdTagEnd};
 use pullup::mdbook::{Event as MdbookEvent, Tag as MdbookTag};
 use pullup::typst::{CodeBlockDisplay, Event as TypstEvent, Tag as TypstTag};
 use pullup::ParserEvent;
+
+use crate::css::CssClassStyles;
 
 /// Convert mdBook parts to chapters with cover pages.
 #[derive(Debug)]
@@ -72,7 +75,12 @@ where
             }
             (
                 true,
-                Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(num, toc, bookmarks, label)))),
+                Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(
+                    num,
+                    toc,
+                    bookmarks,
+                    label,
+                )))),
             ) => Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(
                 num.saturating_add(1),
                 toc,
@@ -81,7 +89,12 @@ where
             )))),
             (
                 true,
-                Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(num, toc, bookmarks, label)))),
+                Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(
+                    num,
+                    toc,
+                    bookmarks,
+                    label,
+                )))),
             ) => Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(
                 num.saturating_add(1),
                 toc,
@@ -89,6 +102,91 @@ where
                 label,
             )))),
             (_, x) => x,
+        }
+    }
+}
+
+/// Fix heading stutter where mdBook emits duplicate headings.
+/// When a chapter title and first heading have the same text, mdBook emits both.
+/// This converter removes the duplicate but preserves any labels.
+pub struct FixHeadingStutter<'a, T> {
+    prev: Option<ParserEvent<'a>>,
+    pending_label: Option<ParserEvent<'a>>,
+    iter: T,
+}
+
+impl<'a, T> FixHeadingStutter<'a, T>
+where
+    T: Iterator<Item = ParserEvent<'a>>,
+{
+    #[allow(dead_code)]
+    pub fn new(iter: T) -> Self {
+        Self {
+            prev: None,
+            pending_label: None,
+            iter,
+        }
+    }
+}
+
+impl<'a, T> Iterator for FixHeadingStutter<'a, T>
+where
+    T: Iterator<Item = ParserEvent<'a>>,
+{
+    type Item = ParserEvent<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // If we have a pending label to emit, return it first
+        if let Some(label) = self.pending_label.take() {
+            return Some(label);
+        }
+
+        match (&mut self.prev, self.iter.next()) {
+            (
+                Some(
+                    event @ ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::End(
+                        MdTagEnd::Heading(_),
+                    ))),
+                ),
+                Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::Start(
+                    MdTag::Heading { .. },
+                )))),
+            ) => {
+                self.prev = Some(event.clone());
+                let _ = self.iter.find(|x| {
+                    !matches!(
+                        x,
+                        ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::End(
+                            MdTagEnd::Heading(_)
+                        ),)),
+                    )
+                });
+                self.iter.next()
+            }
+            (
+                event @ Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(..)))),
+                Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Heading(_, _, _, label)))),
+            ) => {
+                self.prev = event.clone();
+                // If the stutter heading has a label, preserve it as a standalone label
+                if let Some(ref lbl) = label {
+                    self.pending_label = Some(ParserEvent::Typst(TypstEvent::Raw(
+                        format!("#[] <{}>\n", lbl).into(),
+                    )));
+                }
+                // Skip to the end of this heading
+                let _ = self.iter.find(|x| {
+                    matches!(
+                        x,
+                        ParserEvent::Typst(TypstEvent::End(TypstTag::Heading(..)))
+                    )
+                });
+                self.next()
+            }
+            (_, x) => {
+                self.prev = x.clone();
+                x
+            }
         }
     }
 }
@@ -216,9 +314,10 @@ where
 
                 // If there's a filename, emit it as a styled block before the code
                 if let Some(ref fname) = filename {
-                    self.buf.push_back(ParserEvent::Typst(TypstEvent::Start(
-                        TypstTag::CodeBlock(lang_cow, display),
-                    )));
+                    self.buf
+                        .push_back(ParserEvent::Typst(TypstEvent::Start(TypstTag::CodeBlock(
+                            lang_cow, display,
+                        ))));
                     // Return the filename display first
                     Some(ParserEvent::Typst(TypstEvent::Raw(
                         format!(
@@ -244,9 +343,11 @@ where
 
                 // If there's a filename, emit it as a styled block before the code
                 if let Some(ref fname) = filename {
-                    self.buf.push_back(ParserEvent::Typst(TypstEvent::Start(
-                        TypstTag::CodeBlock(lang_cow, CodeBlockDisplay::Block),
-                    )));
+                    self.buf
+                        .push_back(ParserEvent::Typst(TypstEvent::Start(TypstTag::CodeBlock(
+                            lang_cow,
+                            CodeBlockDisplay::Block,
+                        ))));
                     // Return the filename display first
                     Some(ParserEvent::Typst(TypstEvent::Raw(
                         format!(
@@ -273,9 +374,11 @@ where
 
                 // If there's a filename, emit it as a styled block before the code
                 if let Some(ref fname) = filename {
-                    self.buf.push_back(ParserEvent::Typst(TypstEvent::Start(
-                        TypstTag::CodeBlock(lang_cow, CodeBlockDisplay::Block),
-                    )));
+                    self.buf
+                        .push_back(ParserEvent::Typst(TypstEvent::Start(TypstTag::CodeBlock(
+                            lang_cow,
+                            CodeBlockDisplay::Block,
+                        ))));
                     // Return the filename display first
                     Some(ParserEvent::Typst(TypstEvent::Raw(
                         format!(
@@ -331,12 +434,12 @@ fn detect_callout_type(text: &str) -> Option<(&str, &str, &str)> {
 
     // Check for various callout prefixes
     let patterns = [
-        ("Note:", "note", "rgb(\"#1976D2\")"),        // Blue
-        ("Warning:", "warning", "rgb(\"#F57C00\")"), // Orange
-        ("Tip:", "tip", "rgb(\"#388E3C\")"),         // Green
+        ("Note:", "note", "rgb(\"#1976D2\")"),           // Blue
+        ("Warning:", "warning", "rgb(\"#F57C00\")"),     // Orange
+        ("Tip:", "tip", "rgb(\"#388E3C\")"),             // Green
         ("Important:", "important", "rgb(\"#D32F2F\")"), // Red
-        ("Caution:", "caution", "rgb(\"#F57C00\")"), // Orange
-        ("Info:", "info", "rgb(\"#1976D2\")"),       // Blue
+        ("Caution:", "caution", "rgb(\"#F57C00\")"),     // Orange
+        ("Info:", "info", "rgb(\"#1976D2\")"),           // Blue
     ];
 
     for (prefix, callout_type, color) in patterns {
@@ -430,9 +533,8 @@ where
                                         ));
                                     }
                                 } else {
-                                    self.output_buffer.push_back(ParserEvent::Typst(
-                                        TypstEvent::Text(text),
-                                    ));
+                                    self.output_buffer
+                                        .push_back(ParserEvent::Typst(TypstEvent::Text(text)));
                                 }
                             }
                             _ => {
@@ -475,17 +577,17 @@ where
 /// ```
 ///
 /// This converter extracts those IDs and emits them as Typst labels.
-#[derive(Debug)]
 pub struct ConvertHtmlAnchors<T> {
     iter: T,
+    css_styles: Arc<CssClassStyles>,
 }
 
 impl<'a, T> ConvertHtmlAnchors<T>
 where
     T: Iterator<Item = ParserEvent<'a>>,
 {
-    pub fn new(iter: T) -> Self {
-        Self { iter }
+    pub fn new(iter: T, css_styles: Arc<CssClassStyles>) -> Self {
+        Self { iter, css_styles }
     }
 }
 
@@ -499,19 +601,34 @@ where
         match self.iter.next() {
             // Handle block-level HTML
             Some(ParserEvent::Markdown(MdEvent::Html(html))) => {
-                convert_html_to_typst(html.as_ref())
+                convert_html_to_typst(html.as_ref(), &self.css_styles)
             }
             // Handle inline HTML (this is where <a id="..."> often appears)
             Some(ParserEvent::Markdown(MdEvent::InlineHtml(html))) => {
-                convert_html_to_typst(html.as_ref())
+                convert_html_to_typst(html.as_ref(), &self.css_styles)
             }
             // Handle mdbook wrapper for block HTML
             Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::Html(html)))) => {
-                convert_html_to_typst(html.as_ref())
+                convert_html_to_typst(html.as_ref(), &self.css_styles)
             }
             // Handle mdbook wrapper for inline HTML
-            Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::InlineHtml(html)))) => {
-                convert_html_to_typst(html.as_ref())
+            Some(ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::InlineHtml(
+                html,
+            )))) => convert_html_to_typst(html.as_ref(), &self.css_styles),
+            // Handle Typst Raw events that contain HTML comments (from pullup's conversion)
+            // These look like: /* HTML: <actual html> */
+            Some(ParserEvent::Typst(TypstEvent::Raw(raw))) => {
+                if let Some(html) = extract_html_from_comment(raw.as_ref()) {
+                    if let Some(converted) = convert_html_to_typst(&html, &self.css_styles) {
+                        // Only use conversion if it's not just another comment
+                        if !matches!(&converted, ParserEvent::Typst(TypstEvent::Raw(r)) if r.contains("/* HTML:"))
+                        {
+                            return Some(converted);
+                        }
+                    }
+                }
+                // Pass through unchanged if not convertible
+                Some(ParserEvent::Typst(TypstEvent::Raw(raw)))
             }
             // Pass through all other events
             x => x,
@@ -611,9 +728,9 @@ where
                 self.copy_asset(dest_url.as_ref());
             }
             // mdBook wrapped markdown image events
-            ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(
-                MdEvent::Start(MdTag::Image { dest_url, .. })
-            )) => {
+            ParserEvent::Mdbook(MdbookEvent::MarkdownContentEvent(MdEvent::Start(
+                MdTag::Image { dest_url, .. },
+            ))) => {
                 self.copy_asset(dest_url.as_ref());
             }
             // HTML img tags (block-level)
@@ -639,6 +756,14 @@ where
                     self.copy_asset(&src);
                 }
             }
+            // Typst Raw events containing HTML comments (from pullup's conversion)
+            ParserEvent::Typst(TypstEvent::Raw(raw)) => {
+                if let Some(html) = extract_html_from_comment(raw.as_ref()) {
+                    if let Some(src) = extract_img_src(&html) {
+                        self.copy_asset(&src);
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -649,9 +774,9 @@ where
 /// Convert HTML to Typst markup.
 /// Handles:
 /// - `<a id="...">` -> Typst label
-/// - `<img src="..." alt="...">` -> Typst image
+/// - `<img src="..." alt="...">` -> Typst image with CSS-based sizing
 /// - Other HTML -> comment
-fn convert_html_to_typst(html: &str) -> Option<ParserEvent<'static>> {
+fn convert_html_to_typst(html: &str, css_styles: &CssClassStyles) -> Option<ParserEvent<'static>> {
     // Check for anchor with id
     if let Some(id) = extract_anchor_id(html) {
         return Some(ParserEvent::Typst(TypstEvent::Raw(
@@ -664,15 +789,109 @@ fn convert_html_to_typst(html: &str) -> Option<ParserEvent<'static>> {
         let alt = extract_img_alt(html).unwrap_or_default();
         // Escape quotes in alt text
         let alt_escaped = alt.replace('"', "\\\"");
-        return Some(ParserEvent::Typst(TypstEvent::Raw(
-            format!("#image(\"{}\", alt: \"{}\")", src, alt_escaped).into(),
-        )));
+
+        // Check for CSS class and get corresponding width/height from parsed CSS
+        let class = extract_html_class(html);
+        let width = class.as_ref().and_then(|c| css_styles.get_width(c));
+        let height = class.as_ref().and_then(|c| css_styles.get_height(c));
+
+        let img_call = match (width, height) {
+            (Some(w), Some(h)) => {
+                format!(
+                    "#image(\"{}\", alt: \"{}\", width: {}, height: {})",
+                    src, alt_escaped, w, h
+                )
+            }
+            (Some(w), None) => {
+                format!(
+                    "#image(\"{}\", alt: \"{}\", width: {})",
+                    src, alt_escaped, w
+                )
+            }
+            (None, Some(h)) => {
+                format!(
+                    "#image(\"{}\", alt: \"{}\", height: {})",
+                    src, alt_escaped, h
+                )
+            }
+            (None, None) => {
+                // No specific size from CSS - just use the image as-is
+                format!("#image(\"{}\", alt: \"{}\")", src, alt_escaped)
+            }
+        };
+
+        return Some(ParserEvent::Typst(TypstEvent::Raw(img_call.into())));
     }
 
     // Fall back to comment for other HTML
     Some(ParserEvent::Typst(TypstEvent::Raw(
         format!("/* HTML: {} */\n", html.replace("*/", "* /")).into(),
     )))
+}
+
+/// Extract HTML content from a Typst comment like `/* HTML: <img ...> */`.
+fn extract_html_from_comment(comment: &str) -> Option<String> {
+    let comment = comment.trim();
+    if comment.starts_with("/* HTML:") && comment.ends_with("*/") {
+        // Extract the HTML between "/* HTML:" and "*/"
+        let html = &comment[8..comment.len() - 2];
+        // Undo the escaping we did (replace "* /" back to "*/")
+        let html = html.replace("* /", "*/").trim().to_string();
+        if !html.is_empty() {
+            return Some(html);
+        }
+    }
+    None
+}
+
+/// Post-process Typst markup strings to replace HTML comments with proper Typst code.
+/// This handles HTML that was embedded inside table cells or other constructs where
+/// the event-based conversion couldn't intercept it.
+pub fn process_html_comments(markup: &str, css_styles: &CssClassStyles) -> String {
+    use regex::Regex;
+
+    // Match /* HTML: <img ...> */ patterns
+    let re = Regex::new(r"/\* HTML: (<img[^>]*/?>) \*/").unwrap();
+
+    re.replace_all(markup, |caps: &regex::Captures| {
+        let html = &caps[1];
+        if let Some(src) = extract_img_src(html) {
+            let alt = extract_img_alt(html).unwrap_or_default();
+            let alt_escaped = alt.replace('"', "\\\"");
+
+            let class = extract_html_class(html);
+            let width = class.as_ref().and_then(|c| css_styles.get_width(c));
+            let height = class.as_ref().and_then(|c| css_styles.get_height(c));
+
+            match (width, height) {
+                (Some(w), Some(h)) => {
+                    format!(
+                        "#image(\"{}\", alt: \"{}\", width: {}, height: {})",
+                        src, alt_escaped, w, h
+                    )
+                }
+                (Some(w), None) => {
+                    format!(
+                        "#image(\"{}\", alt: \"{}\", width: {})",
+                        src, alt_escaped, w
+                    )
+                }
+                (None, Some(h)) => {
+                    format!(
+                        "#image(\"{}\", alt: \"{}\", height: {})",
+                        src, alt_escaped, h
+                    )
+                }
+                (None, None) => {
+                    format!("#image(\"{}\", alt: \"{}\")", src, alt_escaped)
+                }
+            }
+        } else {
+            // Not an img we can convert, leave it as-is
+            caps[0].to_string()
+        }
+    })
+    .to_string()
 }
 
 /// Extract the alt attribute from an HTML img tag.
@@ -686,12 +905,12 @@ fn extract_img_alt(html: &str) -> Option<String> {
     // Look for alt attribute
     if let Some(alt_start) = html.find("alt=") {
         let rest = &html[alt_start + 4..];
-        let alt = if rest.starts_with('"') {
-            rest[1..].split('"').next()
-        } else if rest.starts_with('\'') {
-            rest[1..].split('\'').next()
+        let alt = if let Some(rest) = rest.strip_prefix('"') {
+            rest.split('"').next()
+        } else if let Some(rest) = rest.strip_prefix('\'') {
+            rest.split('\'').next()
         } else {
-            rest.split(|c| c == ' ' || c == '>').next()
+            rest.split([' ', '>']).next()
         };
 
         alt.map(|s| s.to_string())
@@ -712,18 +931,39 @@ fn extract_img_src(html: &str) -> Option<String> {
     // Look for src attribute
     if let Some(src_start) = html.find("src=") {
         let rest = &html[src_start + 4..];
-        let src = if rest.starts_with('"') {
+        let src = if let Some(rest) = rest.strip_prefix('"') {
             // Double quoted
-            rest[1..].split('"').next()
-        } else if rest.starts_with('\'') {
+            rest.split('"').next()
+        } else if let Some(rest) = rest.strip_prefix('\'') {
             // Single quoted
-            rest[1..].split('\'').next()
+            rest.split('\'').next()
         } else {
             // Unquoted - take until space or >
-            rest.split(|c| c == ' ' || c == '>').next()
+            rest.split([' ', '>']).next()
         };
 
         src.map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract the class attribute from an HTML tag.
+fn extract_html_class(html: &str) -> Option<String> {
+    let html = html.trim();
+
+    // Look for class attribute
+    if let Some(class_start) = html.find("class=") {
+        let rest = &html[class_start + 6..];
+        let class = if let Some(rest) = rest.strip_prefix('"') {
+            rest.split('"').next()
+        } else if let Some(rest) = rest.strip_prefix('\'') {
+            rest.split('\'').next()
+        } else {
+            rest.split([' ', '>']).next()
+        };
+
+        class.map(|s| s.to_string())
     } else {
         None
     }
@@ -741,15 +981,15 @@ fn extract_anchor_id(html: &str) -> Option<String> {
     // Look for id attribute
     if let Some(id_start) = html.find("id=") {
         let rest = &html[id_start + 3..];
-        let id = if rest.starts_with('"') {
+        let id = if let Some(rest) = rest.strip_prefix('"') {
             // Double quoted
-            rest[1..].split('"').next()
-        } else if rest.starts_with('\'') {
+            rest.split('"').next()
+        } else if let Some(rest) = rest.strip_prefix('\'') {
             // Single quoted
-            rest[1..].split('\'').next()
+            rest.split('\'').next()
         } else {
             // Unquoted - take until space or >
-            rest.split(|c| c == ' ' || c == '>').next()
+            rest.split([' ', '>']).next()
         };
 
         id.map(|s| s.to_string())
@@ -941,5 +1181,58 @@ mod tests {
             let (prefix, _, _) = result.unwrap();
             assert_eq!(prefix, "Note:");
         }
+    }
+}
+
+#[cfg(test)]
+mod html_comment_tests {
+    use super::*;
+
+    #[test]
+    fn extract_from_comment() {
+        let input = r#"/* HTML: <img src="img/ferris.svg" class="ferris-explain" alt="test"/> */"#;
+        let result = extract_html_from_comment(input);
+        assert_eq!(
+            result,
+            Some(r#"<img src="img/ferris.svg" class="ferris-explain" alt="test"/>"#.to_string())
+        );
+    }
+
+    #[test]
+    fn extract_from_comment_with_newline() {
+        let input = "/* HTML: <img src=\"test.png\"/> */\n";
+        let result = extract_html_from_comment(input);
+        assert_eq!(result, Some("<img src=\"test.png\"/>".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod process_html_comments_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn convert_ferris_img() {
+        let css = Arc::new(CssClassStyles::new());
+        let input =
+            r#"[/* HTML: <img src="img/ferris/test.svg" class="ferris-explain" alt="Ferris"/> */]"#;
+        let result = process_html_comments(input, &css);
+        assert!(
+            result.contains("#image"),
+            "Expected #image, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn convert_self_closing_img() {
+        let css = Arc::new(CssClassStyles::new());
+        let input = r#"/* HTML: <img src="test.png" alt="test"/> */"#;
+        let result = process_html_comments(input, &css);
+        assert!(
+            result.contains("#image"),
+            "Expected #image, got: {}",
+            result
+        );
     }
 }
