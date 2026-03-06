@@ -9,6 +9,15 @@ This document lists the required tools, their versions currently installed on th
 
 ### Installation
 
+#### Using cargo-binstall (recommended - fast, no compilation)
+
+```sh
+cargo install cargo-binstall
+cargo binstall mdbook-typst
+```
+
+This downloads pre-compiled binaries instead of compiling from source.
+
 #### From source (recommended for latest features)
 
 ```sh
