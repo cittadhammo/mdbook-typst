@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::iter;
 
 use mdbook::renderer::RenderContext;
@@ -38,11 +38,57 @@ fn none_on_empty_vec<T: Clone>(x: &[T]) -> Option<Vec<T>> {
 
 const TYPST_MARKUP_NAME: &str = "book.typst";
 
+/// Translate an `mdbook` 0.5+ `RenderContext` JSON payload into the shape the
+/// `mdbook` 0.4 crate expects, so this backend keeps working with both major
+/// versions of the `mdbook` CLI.
+///
+/// Two incompatibilities are handled:
+///
+/// 1. `Book::sections` was renamed to `Book::items` in mdBook 0.5
+///    (rust-lang/mdBook#2813). 0.4's `Book` also has a private
+///    `__non_exhaustive: ()` field that must appear in the JSON.
+/// 2. mdBook 0.4 deserializes its `Config` via `toml::Value`, which has no
+///    null. mdBook 0.5 happily emits `null` for unset optional fields, so we
+///    strip nulls from the config subtree.
+fn translate_render_context_json(input: &str) -> String {
+    use serde_json::Value;
+
+    let Ok(mut value) = serde_json::from_str::<Value>(input) else {
+        return input.to_string();
+    };
+
+    if let Some(book) = value.get_mut("book").and_then(Value::as_object_mut) {
+        if let Some(items) = book.remove("items") {
+            book.entry("sections").or_insert(items);
+        }
+        book.entry("__non_exhaustive").or_insert(Value::Null);
+    }
+
+    if let Some(config) = value.get_mut("config") {
+        strip_nulls(config);
+    }
+
+    serde_json::to_string(&value).unwrap_or_else(|_| input.to_string())
+}
+
+fn strip_nulls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            map.values_mut().for_each(strip_nulls);
+        }
+        serde_json::Value::Array(arr) => arr.iter_mut().for_each(strip_nulls),
+        _ => {}
+    }
+}
+
 fn main() -> Result<(), std::io::Error> {
     tracing_subscriber::fmt().init();
 
-    let mut stdin = io::stdin();
-    let ctx = RenderContext::from_json(&mut stdin).unwrap();
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw)?;
+    let translated = translate_render_context_json(&raw);
+    let ctx = RenderContext::from_json(translated.as_bytes()).unwrap();
     let cfg: Config = ctx
         .config
         .get_deserialized_opt("output.typst")
@@ -477,4 +523,135 @@ fn main() -> Result<(), std::io::Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ctx_05() -> serde_json::Value {
+        json!({
+            "version": "0.5.2",
+            "root": "/tmp/book",
+            "book": {
+                "items": [{
+                    "Chapter": {
+                        "name": "Chapter 1",
+                        "content": "# Chapter 1\n",
+                        "number": [1],
+                        "sub_items": [],
+                        "path": "chapter_1.md",
+                        "source_path": "chapter_1.md",
+                        "parent_names": []
+                    }
+                }]
+            },
+            "config": {
+                "book": {
+                    "title": "Test",
+                    "authors": ["Christian Legnitto"],
+                    "description": null,
+                    "language": "en",
+                    "text-direction": null
+                },
+                "output": { "typst": { "command": "mdbook-typst" } }
+            },
+            "destination": "/tmp/book/book"
+        })
+    }
+
+    fn ctx_04() -> serde_json::Value {
+        json!({
+            "version": "0.4.52",
+            "root": "/tmp/book",
+            "book": {
+                "sections": [{
+                    "Chapter": {
+                        "name": "Chapter 1",
+                        "content": "# Chapter 1\n",
+                        "number": [1],
+                        "sub_items": [],
+                        "path": "chapter_1.md",
+                        "source_path": "chapter_1.md",
+                        "parent_names": []
+                    }
+                }],
+                "__non_exhaustive": null
+            },
+            "config": {
+                "book": {
+                    "title": "Test",
+                    "authors": ["Christian Legnitto"],
+                    "src": "src",
+                    "language": "en"
+                },
+                "output": { "typst": { "command": "mdbook-typst" } }
+            },
+            "destination": "/tmp/book/book"
+        })
+    }
+
+    #[test]
+    fn translates_mdbook_05_payload() {
+        let translated = translate_render_context_json(&ctx_05().to_string());
+        let value: serde_json::Value = serde_json::from_str(&translated).unwrap();
+
+        let book = value["book"].as_object().unwrap();
+        assert!(
+            book.contains_key("sections"),
+            "items should be renamed to sections"
+        );
+        assert!(!book.contains_key("items"));
+        assert!(book.contains_key("__non_exhaustive"));
+
+        let book_cfg = value["config"]["book"].as_object().unwrap();
+        assert!(
+            !book_cfg.contains_key("description"),
+            "null fields should be stripped"
+        );
+        assert!(!book_cfg.contains_key("text-direction"));
+        assert_eq!(book_cfg["title"], "Test");
+
+        // The translated payload must be deserializable by mdbook 0.4.
+        RenderContext::from_json(translated.as_bytes())
+            .expect("0.5 payload deserializes after translation");
+    }
+
+    #[test]
+    fn passes_through_mdbook_04_payload() {
+        let original = ctx_04().to_string();
+        let translated = translate_render_context_json(&original);
+
+        // Existing 0.4 fields are preserved (not double-renamed or stripped).
+        let value: serde_json::Value = serde_json::from_str(&translated).unwrap();
+        assert!(value["book"]["sections"].is_array());
+        assert!(value["book"].get("items").is_none());
+        assert_eq!(value["config"]["book"]["title"], "Test");
+
+        RenderContext::from_json(translated.as_bytes()).expect("0.4 payload deserializes");
+    }
+
+    #[test]
+    fn invalid_json_is_returned_unchanged() {
+        let translated = translate_render_context_json("not json {");
+        assert_eq!(translated, "not json {");
+    }
+
+    #[test]
+    fn strip_nulls_is_recursive() {
+        let mut value = json!({
+            "a": null,
+            "b": { "c": null, "d": 1, "e": { "f": null } },
+            "g": [{ "h": null, "i": 2 }]
+        });
+        strip_nulls(&mut value);
+        assert_eq!(
+            value,
+            json!({
+                "b": { "d": 1, "e": {} },
+                "g": [{ "i": 2 }]
+            })
+        );
+    }
 }

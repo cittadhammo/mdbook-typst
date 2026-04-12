@@ -21,3 +21,4 @@ pullup = { version = "0.4.2", features = [
 serde = { version = "1.0", features = ["derive"] }
 cssparser = "0.34"
 regex = "1"
+serde_json = "1.0.149"
