@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,8 +7,97 @@ use pullup::markdown::{CodeBlockKind, CowStr, Event as MdEvent, Tag as MdTag, Ta
 use pullup::mdbook::{Event as MdbookEvent, Tag as MdbookTag};
 use pullup::typst::{CodeBlockDisplay, Event as TypstEvent, Tag as TypstTag};
 use pullup::ParserEvent;
+use regex::Regex;
 
 use crate::css::CssClassStyles;
+
+/// Convert Markdown footnote definitions and references into Typst footnotes.
+///
+/// mdBook/pullup currently exposes these as ordinary text. We therefore do a
+/// small, deliberately conservative pass over the generated Typst text. A
+/// definition may span indented continuation lines, and references are
+/// replaced only when their definition exists. Formatting produced by the
+/// Markdown converter (quotes, images, emphasis, and so on) is retained as
+/// Typst content instead of being flattened to plain text.
+pub fn process_events<'a>(events: impl Iterator<Item = ParserEvent<'a>>) -> Vec<ParserEvent<'a>> {
+    let definition_re =
+        Regex::new(r"(?m)^[ \t]{0,3}\[\^([^\s\]]+)\]:[ \t]*(.*(?:\n(?:[ \t]{2,}|\t).*)*)")
+            .expect("valid footnote definition regex");
+    let reference_re = Regex::new(r"\[\^([^\s\]]+)\]").expect("valid footnote reference regex");
+
+    let mut definitions = HashMap::new();
+    let mut events = events.collect::<Vec<_>>();
+
+    // Collect definitions first so references can appear before their source.
+    for event in &mut events {
+        if let ParserEvent::Typst(TypstEvent::Text(text)) = event {
+            let (cleaned, found) = extract_footnote_definitions(text, &definition_re);
+            definitions.extend(found);
+            *text = cleaned.into();
+        }
+    }
+
+    let mut final_events = Vec::with_capacity(events.len());
+    for event in events {
+        let event = match event {
+            ParserEvent::Typst(TypstEvent::Text(text)) => {
+                let updated = reference_re.replace_all(&text, |caps: &regex::Captures| {
+                    definitions
+                        .get(&caps[1])
+                        .map(|content| format!("#footnote[{}]", content))
+                        .unwrap_or_else(|| caps[0].to_string())
+                });
+                // TypstMarkup escapes raw `#` characters in text events. The
+                // final output pass removes that escape for generated calls.
+                yield_text(updated.into_owned())
+            }
+            other => other,
+        };
+        final_events.push(event);
+    }
+
+    final_events
+}
+
+fn extract_footnote_definitions(
+    text: &str,
+    definition_re: &Regex,
+) -> (String, HashMap<String, String>) {
+    let mut definitions = HashMap::new();
+    let mut cleaned = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    for captures in definition_re.captures_iter(text) {
+        let whole = captures.get(0).expect("footnote match");
+        cleaned.push_str(&text[cursor..whole.start()]);
+        let label = captures[1].to_string();
+        let content = captures[2].trim().to_string();
+        definitions.insert(label, footnote_content(content));
+        cursor = whole.end();
+    }
+
+    cleaned.push_str(&text[cursor..]);
+    (cleaned, definitions)
+}
+
+fn footnote_content(content: String) -> String {
+    // Markdown that has already become Typst markup must remain executable so
+    // quotes, images, emphasis, and figures continue to work. Plain text is
+    // escaped to prevent a literal square bracket from terminating the
+    // surrounding Typst content block.
+    if content.contains('#') {
+        content
+    } else {
+        content
+            .replace('\\', r"\\")
+            .replace('[', r"\[")
+            .replace(']', r"\]")
+    }
+}
+
+fn yield_text(text: String) -> ParserEvent<'static> {
+    ParserEvent::Typst(TypstEvent::Text(text.into()))
+}
 
 /// Convert mdBook parts to chapters with cover pages.
 #[derive(Debug)]
@@ -1459,5 +1548,37 @@ mod process_html_comments_tests {
             "Expected #image, got: {}",
             result
         );
+    }
+}
+
+#[cfg(test)]
+mod footnote_tests {
+    use super::*;
+
+    fn definition_regex() -> Regex {
+        Regex::new(r"(?m)^[ \t]{0,3}\[\^([^\s\]]+)\]:[ \t]*(.*(?:\n(?:[ \t]{2,}|\t).*)*)").unwrap()
+    }
+
+    #[test]
+    fn extracts_multiline_definition_and_keeps_surrounding_text() {
+        let input = "Before\n[^source]: First line\n  continuation\nAfter";
+        let (cleaned, definitions) = extract_footnote_definitions(input, &definition_regex());
+
+        assert_eq!(cleaned, "Before\n\nAfter");
+        assert_eq!(definitions["source"], "First line\n  continuation");
+    }
+
+    #[test]
+    fn escapes_square_brackets_in_plain_text() {
+        assert_eq!(
+            footnote_content("A [literal] note".into()),
+            r"A \[literal\] note"
+        );
+    }
+
+    #[test]
+    fn preserves_typst_markup_for_quotes_and_images() {
+        let content = "#quote[Quoted text] #image(\"figure.png\")".to_string();
+        assert_eq!(footnote_content(content.clone()), content);
     }
 }
