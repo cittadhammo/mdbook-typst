@@ -12,10 +12,11 @@ use pullup::ParserEvent;
 mod config;
 mod converters;
 mod css;
+mod footnotes;
 
 use config::Config;
 use converters::{
-    process_events, ConvertCallouts, ConvertHtmlAnchors, CopyReferencedAssets, FixCodeBlockFence,
+    ConvertCallouts, ConvertHtmlAnchors, CopyReferencedAssets, FixCodeBlockFence,
     FixHeadingStutter, PartToCoverPage, ResolveCssImageStyles,
 };
 use css::CssClassStyles;
@@ -104,20 +105,19 @@ fn main() -> Result<(), std::io::Error> {
     css_styles.load_css_directory(&ctx.root);
     let css_styles = std::sync::Arc::new(css_styles);
 
-    // Parse mdbook to events.
-    let parser = pullup::mdbook::Parser::from_rendercontext(&ctx);
+    // Parse mdBook content with pulldown-cmark footnotes enabled.
+    let parser = footnotes::mdbook_events(&ctx);
 
     // Convert the mdbook events to pullup `ParserEvent`s.
     let mut events: Box<dyn Iterator<Item = ParserEvent<'_>>> = Box::new(
         pullup::mdbook::to::typst::Conversion::builder()
-            .events(parser.iter().cloned())
+            .events(parser.into_iter())
             .build(),
     );
 
-    // mdBook treats footnote syntax as ordinary Markdown text. Convert it
-    // after pullup has produced Typst events, before the other event filters
-    // and template are applied.
-    events = Box::new(process_events(events).into_iter());
+    // Resolve structured footnote definitions after Markdown has been
+    // converted to Typst events, retaining the complete event body.
+    events = Box::new(footnotes::process_events(events).into_iter());
 
     //println!("{:#?}", events.collect::<Vec<_>>());
     //panic!("x");
@@ -512,9 +512,8 @@ fn main() -> Result<(), std::io::Error> {
     let full_markup: String = markup.collect();
 
     // Post-process HTML comments embedded in table cells to convert them to images
-    let full_markup = converters::process_html_comments(&full_markup, &css_styles)
-        .replace(r"\#footnote", "#footnote")
-        .replace(r"====", "===");
+    let full_markup =
+        converters::process_html_comments(&full_markup, &css_styles).replace(r"====", "===");
 
     let full_markup = if template.is_empty() {
         full_markup
