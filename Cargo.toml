@@ -1,6 +1,6 @@
 [package]
 name = "mdbook-typst"
-version = "0.1.6"
+version = "0.1.10"
 license = "MIT OR Apache-2.0"
 description = "An mdBook backend to output Typst markup, pdf, png, or svg"
 authors = ["Christian Legnitto <christian@legnitto.com>"]
@@ -10,8 +10,8 @@ edition = "2021"
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = "0.3"
-mdbook = { version = "0.4.35", default-features = false }
-pullup = { version = "0.3.5", features = [
+mdbook = { version = "0.4.52", default-features = false }
+pullup = { version = "0.4.2", features = [
     "builder",
     "mdbook",
     "markdown",
@@ -19,4 +19,6 @@ pullup = { version = "0.3.5", features = [
     "tracing"
 ] }
 serde = { version = "1.0", features = ["derive"] }
-regex = "1.8"  # Use the latest version or a version compatible with your project
+cssparser = "0.34"
+regex = "1"
+serde_json = "1.0.149"
