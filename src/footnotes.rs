@@ -13,7 +13,7 @@ use pullup::markdown::{
 use pullup::mdbook::{
     ChapterSource, ChapterStatus, ContentType, Event as MdbookEvent, Tag as MdbookTag,
 };
-use pullup::typst::Event as TypstEvent;
+use pullup::typst::{Event as TypstEvent, Tag as TypstTag};
 use pullup::ParserEvent;
 
 /// Build the mdBook event stream while enabling pulldown-cmark footnotes.
@@ -156,7 +156,10 @@ pub fn process_events<'a>(events: impl Iterator<Item = ParserEvent<'a>>) -> Vec<
                 end += 1;
             }
             if end < events.len() {
-                definitions.insert(label, events[index + 1..end].to_vec());
+                definitions.insert(
+                    label,
+                    trim_single_paragraph(events[index + 1..end].to_vec()),
+                );
                 for item in &mut skipped[index..=end] {
                     *item = true;
                 }
@@ -187,6 +190,26 @@ pub fn process_events<'a>(events: impl Iterator<Item = ParserEvent<'a>>) -> Vec<
         }
     }
     output
+}
+
+/// A Markdown footnote definition normally arrives as one paragraph. The
+/// Typst converter represents that paragraph as `#par[...]`; nesting it inside
+/// `#footnote[...]` makes the book-wide paragraph spacing apply between the
+/// footnote rule, marker, and text. Strip only that outer paragraph wrapper.
+fn trim_single_paragraph(mut body: Vec<ParserEvent<'_>>) -> Vec<ParserEvent<'_>> {
+    let starts_paragraph = matches!(
+        body.first(),
+        Some(ParserEvent::Typst(TypstEvent::Start(TypstTag::Paragraph)))
+    );
+    let ends_paragraph = matches!(
+        body.last(),
+        Some(ParserEvent::Typst(TypstEvent::End(TypstTag::Paragraph)))
+    );
+    if starts_paragraph && ends_paragraph {
+        body.remove(0);
+        body.pop();
+    }
+    body
 }
 
 #[cfg(test)]
@@ -236,5 +259,17 @@ mod tests {
             output[2],
             ParserEvent::Typst(TypstEvent::Raw(ref text)) if text.to_string() == "]"
         ));
+    }
+
+    #[test]
+    fn removes_only_the_outer_single_paragraph() {
+        let body = vec![
+            ParserEvent::Typst(TypstEvent::Start(TypstTag::Paragraph)),
+            ParserEvent::Typst(TypstEvent::Raw("text".into())),
+            ParserEvent::Typst(TypstEvent::End(TypstTag::Paragraph)),
+        ];
+        let body = trim_single_paragraph(body);
+        assert_eq!(body.len(), 1);
+        assert!(matches!(body[0], ParserEvent::Typst(TypstEvent::Raw(_))));
     }
 }
